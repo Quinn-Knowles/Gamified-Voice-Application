@@ -1,9 +1,0 @@
-
-1. Multi‑Factor Point System
-
-Instead of just “time in range,” award points for several dimensions of performance:
-Factor	How it works
-Base Points	+1 point for each second (or fraction of a second) the pitch stays within the target range.
-Accuracy Bonus	At the end of each 30‑sec block, +50 bonus points if ≥90% of that block was on‑target.
-Consistency Multiplier	For every continuous streak of 10 seconds in‑range, increase your point‑per‑second by ×1.1 (stackable up to ×2.0).
-Improvement Bonus	Compare today’s session to previous: if overall accuracy up by >5%, grant +100 “Growth” points.
