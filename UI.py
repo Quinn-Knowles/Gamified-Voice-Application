@@ -2,7 +2,7 @@ import wx
 import subprocess
 import os
 
-SETTINGS_FILE = "last_settings.txt"
+SETTINGS_FILE = "src/last_settings.txt"
 
 
 class MyFrame(wx.Frame):
@@ -20,7 +20,7 @@ class MyFrame(wx.Frame):
         
         
         # Static Instruction TXT
-        self.instruction_static_text_01 = wx.StaticText(panel, pos=(50, 20), label="Enter Pitch as whole number between 0-999")
+        self.instruction_static_text_01 = wx.StaticText(panel, pos=(50, 20), label="Enter Pitch as whole number between 50-350")
         self.instruction_static_text_02 = wx.StaticText(panel, pos=(50, 150), label="Optional Features")
         
         
@@ -117,7 +117,7 @@ class MyFrame(wx.Frame):
         self.save_settings()
         # Build argument list
         cmd = [
-            "python", "Monitor.py",
+            "python", "src/Monitor.py",
             "--max", str(max_pitch),
             "--min", str(min_pitch),
         ]

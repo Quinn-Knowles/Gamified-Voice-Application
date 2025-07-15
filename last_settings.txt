@@ -1,7 +1,0 @@
-max:500
-min:100
-sentence_monitor:True
-out_of_range:True
-self_mute:False
-resonance:False
-score:False
