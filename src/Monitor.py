@@ -3,12 +3,17 @@ import sounddevice as sd
 import numpy as np
 import parselmouth
 import librosa
+import pygame
 import threading
 import time
-import simpleaudio as sa
+
+SOUNDS = {
+    "error": None,
+    "pinpon": None
+}
 
 # ================================
-# Active: Parselmouth-based pitch
+# Parselmouth-based pitch
 # ================================
 
 def pitch_from_audio(frame, sr):
@@ -16,6 +21,11 @@ def pitch_from_audio(frame, sr):
     Estimate pitch using parselmouth.
     Filters to human voice range 75–400 Hz.
     """
+    frame = np.asarray(frame, dtype=np.float64)
+    if not np.any(np.isfinite(frame)) or not np.any(frame):
+        print("[WARN] Skipping pitch analysis: frame is empty or invalid")
+        return 0.0
+    
     frame = np.asarray(frame, dtype=np.float64).reshape(1, -1)
     snd = parselmouth.Sound(values=frame, sampling_frequency=sr)
     pitch = snd.to_pitch(time_step=0.01, pitch_floor=75, pitch_ceiling=400)
@@ -23,80 +33,114 @@ def pitch_from_audio(frame, sr):
     values = values[values > 0]
     return float(np.median(values)) if len(values) else 0.0
 
-# ================================
-# Parselmouth monitor
-# ================================
+
 
 def is_audio_present(indata, threshold=0.01):
     return np.abs(indata).mean() > threshold
 
-def play_sound(path):
-    wave_obj = sa.WaveObject.from_wave_file(path)
-    wave_obj.play()
+def play_sound_threaded(sound_key):
+    def _play():
+        sound = SOUNDS.get(sound_key)
+        if sound:
+            sound.play()
+    threading.Thread(target=_play, daemon=True).start()
+    
+# ================================
+# Parselmouth monitor
+# ================================
+    
+def parse_sample(args, audio, samplerate, trackers):
+    pitch = pitch_from_audio(audio, samplerate)
+    energy = np.mean(audio ** 2)
+    
+    if pitch > 0:
+        print(f"Detected pitch: {pitch:.1f} Hz")
+    else:
+        print("No pitch detected")
+
+    current_time = time.time()
+    # Check pitch range
+    if args.min <= pitch <= args.max:
+        trackers["in_range_time"] += 1.0
+        trackers["streak"] += 1.0
+    else:
+        trackers["streak"] = 0
+        if args.out_of_range:
+            last_error = trackers.get("last_error_time", 0)
+            if current_time - last_error > 4:
+                play_sound_threaded("error")
+                trackers["last_error_time"] = current_time
+        if args.self_mute:
+            print("[MUTED]")
+
+    trackers["total_time"] += 1.0
+
+    # In-range percentage
+    if trackers["total_time"] > 0:
+        percent = (trackers["in_range_time"] / trackers["total_time"]) * 100
+        print(f"In-range score: {percent:.1f}%")
+
+    # Sentence end detector
+    if args.sentence_monitor:
+        if energy < 1e-4 and trackers["streak"] > 1.0:
+            play_sound_threaded("pinpon")
+
+    # Resonance display
+    if args.resonance:
+        r = resonance_from_audio(audio, samplerate)
+        print(f"Resonance (centroid): {r:.1f} Hz")
+
+    # Write score file every 60 seconds
+    if args.score and trackers["total_time"] >= 60 and trackers["total_time"] % 60 < 1:
+        with open("score.txt", "w") as f:
+            f.write(f"{percent:.1f}% in range\n")
+            
+            
+def load_sounds():
+    try:
+        pygame.mixer.init()
+        SOUNDS["error"] = pygame.mixer.Sound("src/error.wav")
+        SOUNDS["pinpon"] = pygame.mixer.Sound("src/pin-pon.wav")
+    except Exception as e:
+        print(f"[ERROR] Failed to load sound: {e}")
 
 def monitor_loop(args):
-    sr = 22050
-    block_len = 1.0  # seconds
-    block_size = int(block_len * sr)
+    samplerate = 22050
+    block_len = 1.0
+    block_size = int(block_len * samplerate)
 
-    in_range_time = 0.0
-    total_time = 0.0
-    streak = 0.0
-
-    def callback(indata, frames, time_info, status):
-        nonlocal in_range_time, total_time, streak
-        audio = indata[:, 0]
-
-        if not is_audio_present(audio):
-            print("silence")
-            return
-
-        p = pitch_from_audio(audio, sr)
-
-        if p > 0:
-            print(f"Detected pitch: {p:.1f} Hz")
-        else:
-            print("No pitch detected")
-
-        if args.min <= p <= args.max:
-            in_range_time += block_len
-            streak += block_len
-        else:
-            streak = 0
-            if args.out_of_range:
-                play_sound("src/error.wav")
-            if args.self_mute:
-                print("[MUTED]")
-
-        total_time += block_len
-
-        if total_time > 0:
-            percent = (in_range_time / total_time) * 100
-            print(f"Current in-range score: {percent:.1f}%")
-
-        if args.sentence_monitor:
-            energy = np.mean(audio ** 2)
-            if energy < 1e-4 and streak > 1.0:
-                play_sound("src/pin-pon.wav")
-
-        if args.resonance:
-            r = resonance_from_audio(audio, sr)
-            print(f"Resonance (centroid): {r:.1f} Hz")
-
-        if args.score and total_time >= 60.0 and total_time % 60 < block_len:
-            with open("score.txt", "w") as f:
-                f.write(f"{percent:.1f}% in range\n")
-
-    with sd.InputStream(channels=1, samplerate=sr, blocksize=block_size, callback=callback):
-        print("=== Monitoring started — press Ctrl+C to stop ===")
+    trackers = {
+        "in_range_time": 0.0,
+        "total_time": 0.0,
+        "streak": 0.0,
+        "last_error_time": 0.0
+    }
+    with sd.InputStream(channels=1, samplerate=samplerate, blocksize=block_size) as stream:
+        print("=== Listening ===")
         try:
             while True:
-                time.sleep(0.1)
+                audio_block, overflowed = stream.read(block_size)
+                if overflowed:
+                    print("[WARN] Audio buffer overflowed")
+                audio = audio_block[:, 0]
+
+                if is_audio_present(audio):
+                    print("Heard")
+                    try:
+                        parse_sample(args, audio, samplerate, trackers)
+                    except Exception as e:
+                        print(f"[ERROR] Sample parse failed: {e}")
+                else:
+                    print("silence " + str(trackers))
+
         except KeyboardInterrupt:
             print("\n=== Monitoring stopped ===")
-            if args.score and total_time > 0:
-                final_pct = (in_range_time / total_time) * 100
+            if args.score and trackers["total_time"] > 0:
+                final_pct = (trackers["in_range_time"] / trackers["total_time"]) * 100
                 print(f"Final score: {final_pct:.1f}% in range")
+        except Exception as e:
+            print(f"\n[FATAL ERROR] {e}")
+
 
 # ================================
 # UNUSED legacy functions (librosa)
@@ -143,7 +187,11 @@ def main():
     args = p.parse_args()
 
     print("Running with:", args)
+    load_sounds()
     monitor_loop(args)
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        print(f"[FATAL] Uncaught exception: {e}")
