@@ -6,6 +6,7 @@ import librosa
 import pygame
 import threading
 import time
+from scipy.signal import butter, lfilter
 
 SOUNDS = {
     "error": None,
@@ -13,9 +14,17 @@ SOUNDS = {
 }
 
 # ================================
-# Parselmouth-based pitch
+# === Audio feature detection  ===
 # ================================
 
+def bandpass_filter(data, sr, lowcut=75.0, highcut=4000.0, order=4):
+    nyq = 0.5 * sr
+    low = lowcut / nyq
+    high = highcut / nyq
+    b, a = butter(order, [low, high], btype='band')
+    return lfilter(b, a, data)
+
+# Parselmouth-based pitch
 def pitch_from_audio(frame, sr):
     """
     Estimate pitch using parselmouth.
@@ -33,10 +42,57 @@ def pitch_from_audio(frame, sr):
     values = values[values > 0]
     return float(np.median(values)) if len(values) else 0.0
 
+def is_audio_present(indata, sr=22050, threshold=0.005):
+    filtered = bandpass_filter(indata, sr)
+    energy = np.abs(filtered).mean()
+    return energy > threshold
 
+def resonance_from_audio(frame, sr):
+    """
+    Uses Parselmouth (Praat) to extract formants from the audio signal.
+    Returns the average of the first three formants as a resonance proxy.
+    """
+    snd = parselmouth.Sound(frame, sampling_frequency=sr)
+    formant = snd.to_formant_burg()  # You could also use to_formant_keep_all()
+    
+    # Measure over the duration of the audio
+    duration = snd.duration
+    num_samples = 50
+    times = np.linspace(0, duration, num=num_samples)
+    
+    f1_vals, f2_vals, f3_vals = [], [], []
+    
+    for t in times:
+        try:
+            f1 = formant.get_value_at_time(1, t)
+            f2 = formant.get_value_at_time(2, t)
+            f3 = formant.get_value_at_time(3, t)
+            if all(v is not None and not np.isnan(v) for v in [f1, f2, f3]):
+                f1_vals.append(f1)
+                f2_vals.append(f2)
+                f3_vals.append(f3)
+        except Exception as e:
+            print(f"[WARN] Failed to get formant at time {t:.2f}: {e}")
+            continue
+    
+    if not f1_vals:
+        return None  # Could not extract formants
 
-def is_audio_present(indata, threshold=0.01):
-    return np.abs(indata).mean() > threshold
+    # Return the mean formant values (you could return all 3 separately if needed)
+    return {
+        "F1": float(np.mean(f1_vals)),
+        "F2": float(np.mean(f2_vals)),
+        "F3": float(np.mean(f3_vals)),
+        "resonance_score": float(np.mean([np.mean(f1_vals), np.mean(f2_vals), np.mean(f3_vals)]))
+    }
+    
+# ================================
+# === Audio feature detection  ===
+# ================================
+
+# ================================
+# ===  sound Effect Playback   ===
+# ================================
 
 def play_sound_threaded(sound_key):
     def _play():
@@ -45,18 +101,27 @@ def play_sound_threaded(sound_key):
             sound.play()
     threading.Thread(target=_play, daemon=True).start()
     
+def load_sounds():
+    try:
+        pygame.mixer.init()
+        SOUNDS["error"] = pygame.mixer.Sound("src/error.wav")
+        SOUNDS["pinpon"] = pygame.mixer.Sound("src/pin-pon.wav")
+    except Exception as e:
+        print(f"[ERROR] Failed to load sound: {e}")
+        
+
 # ================================
-# Parselmouth monitor
+# ===  sound Effect Playback   ===
+# ================================
+    
+# ================================
+# = Callable monitor for instance=
 # ================================
     
 def parse_sample(args, audio, samplerate, trackers):
     pitch = pitch_from_audio(audio, samplerate)
     energy = np.mean(audio ** 2)
     
-    if pitch > 0:
-        print(f"Detected pitch: {pitch:.1f} Hz")
-    else:
-        print("No pitch detected")
 
     current_time = time.time()
     # Check pitch range
@@ -65,6 +130,8 @@ def parse_sample(args, audio, samplerate, trackers):
         trackers["streak"] += 1.0
     else:
         trackers["streak"] = 0
+        if trackers["sentence"]:
+            trackers["error"] = True
         if args.out_of_range:
             last_error = trackers.get("last_error_time", 0)
             if current_time - last_error > 4:
@@ -80,29 +147,50 @@ def parse_sample(args, audio, samplerate, trackers):
         percent = (trackers["in_range_time"] / trackers["total_time"]) * 100
         print(f"In-range score: {percent:.1f}%")
 
-    # Sentence end detector
+    # === Sentence tracking using time ===
     if args.sentence_monitor:
-        if energy < 1e-4 and trackers["streak"] > 1.0:
-            play_sound_threaded("pinpon")
+        if (trackers["sentence"] == False):
+            trackers["sentence"] = True
+            trackers["sentence_start"] = current_time
+            trackers["sentence_last"] = current_time
+        elif (trackers["error"] == False):
+            trackers["sentence_last"] = current_time
+        
 
     # Resonance display
     if args.resonance:
         r = resonance_from_audio(audio, samplerate)
-        print(f"Resonance (centroid): {r:.1f} Hz")
+        if not r:
+            print("Could not extract resonance features.")
+        else:
+            f1, f2, f3 = r["F1"], r["F2"], r["F3"]
+            resonance_score = r["resonance_score"]
+
+            # Heuristic classification (simplified)
+            if resonance_score < 1800:
+                voice_type = "male"
+            elif resonance_score < 2500:
+                voice_type = "androgynous"
+            else:
+                voice_type = "female"
+
+            print(f"[Resonance] F1: {f1:.1f} Hz | F2: {f2:.1f} Hz | F3: {f3:.1f} Hz | Type: {voice_type}")
+
 
     # Write score file every 60 seconds
-    if args.score and trackers["total_time"] >= 60 and trackers["total_time"] % 60 < 1:
+    if args.score and int(trackers["total_time"]) % 60 == 0 and not trackers.get("score_written", False):
         with open("score.txt", "w") as f:
             f.write(f"{percent:.1f}% in range\n")
+        trackers["score_written"] = True
+    elif int(trackers["total_time"]) % 60 != 0:
+        trackers["score_written"] = False
+# ================================
+# = Callable monitor for instance=
+# ================================
             
-            
-def load_sounds():
-    try:
-        pygame.mixer.init()
-        SOUNDS["error"] = pygame.mixer.Sound("src/error.wav")
-        SOUNDS["pinpon"] = pygame.mixer.Sound("src/pin-pon.wav")
-    except Exception as e:
-        print(f"[ERROR] Failed to load sound: {e}")
+# ================================
+# ===       monitor loop       ===
+# ================================
 
 def monitor_loop(args):
     samplerate = 22050
@@ -113,7 +201,12 @@ def monitor_loop(args):
         "in_range_time": 0.0,
         "total_time": 0.0,
         "streak": 0.0,
-        "last_error_time": 0.0
+        "last_error_time": 0.0,
+        "sentence_start": None,
+        "sentence": False,
+        "sentence_last": None,
+        "error": False,
+        "score": 0.0
     }
     with sd.InputStream(channels=1, samplerate=samplerate, blocksize=block_size) as stream:
         print("=== Listening ===")
@@ -132,6 +225,7 @@ def monitor_loop(args):
                         print(f"[ERROR] Sample parse failed: {e}")
                 else:
                     print("silence " + str(trackers))
+                    silence(trackers)
 
         except KeyboardInterrupt:
             print("\n=== Monitoring stopped ===")
@@ -140,31 +234,30 @@ def monitor_loop(args):
                 print(f"Final score: {final_pct:.1f}% in range")
         except Exception as e:
             print(f"\n[FATAL ERROR] {e}")
+# ================================
+# silence buffer
+# ================================
+
+def silence(trackers):
+    now = time.time()
+    sentence_last = trackers.get("sentence_last")
+
+    # Don't play pinpon if there was an error
+    if trackers.get("error"):
+        trackers["sentence"] = False
+        trackers["error"] = False  # Reset after suppressing reward
+        return
+
+    if trackers.get("sentence") and sentence_last is not None and (now - sentence_last > 1.75):
+        play_sound_threaded("pinpon")
+        trackers["sentence"] = False
+        trackers["score"] = 100 * (sentence_last - trackers["sentence_start"])
 
 
 # ================================
-# UNUSED legacy functions (librosa)
+# silence buffer
 # ================================
 
-def legacy_pitch_from_audio(frame, sr):
-    """
-    Legacy version: librosa.yin pitch estimation.
-    Not used in the main monitor_loop().
-    """
-    f0 = librosa.yin(frame,
-                     fmin=librosa.note_to_hz('C2'),
-                     fmax=librosa.note_to_hz('C7'),
-                     sr=sr)
-    f0 = f0[~np.isnan(f0)]
-    return float(np.median(f0)) if len(f0) else 0.0
-
-def resonance_from_audio(frame, sr):
-    """
-    Spectral centroid as proxy for resonance.
-    Still used if --resonance flag is passed.
-    """
-    centroid = librosa.feature.spectral_centroid(y=frame, sr=sr)
-    return float(np.mean(centroid))
 
 # ================================
 # CLI entry point

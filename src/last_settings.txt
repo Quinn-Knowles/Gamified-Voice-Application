@@ -1,7 +1,7 @@
 max:500
-min:150
+min:170
 sentence_monitor:True
-out_of_range:True
+out_of_range:False
 self_mute:False
-resonance:False
+resonance:True
 score:True
